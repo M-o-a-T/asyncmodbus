@@ -80,3 +80,4 @@ ENV/
 # JIRA plugin
 atlassian-ide-plugin.xml
 
+/.pybuild/

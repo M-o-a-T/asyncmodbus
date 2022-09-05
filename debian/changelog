@@ -1,0 +1,5 @@
+asyncmodbus (0.2-1) smurf; urgency=low
+
+  * source package automatically created by stdeb 0.10.0
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 05 Sep 2022 18:24:09 +0200
