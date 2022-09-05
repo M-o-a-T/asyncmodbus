@@ -1,4 +1,10 @@
-asyncmodbus (0.2-1) smurf; urgency=low
+asyncmodbus (0.2-2) unstable; urgency=medium
+
+  * stupid fix
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 05 Sep 2022 18:26:28 +0200
+
+asyncmodbus (0.2-1) unstable; urgency=low
 
   * source package automatically created by stdeb 0.10.0
 
