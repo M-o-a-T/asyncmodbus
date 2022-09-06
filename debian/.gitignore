@@ -4,4 +4,4 @@
 /*.debhelper-build-stamp
 /*.substvars
 /debhelper-build-stamp
-/python3-asyncmodbus
+/python3-moat-modbus
