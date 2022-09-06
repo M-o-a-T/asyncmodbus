@@ -1,16 +1,16 @@
 import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import setup, find_namespace_packages
 
 if sys.version_info[0:2] < (3, 6):
     raise RuntimeError("This package requires Python 3.6+.")
 
 setup(
-    name="asyncmodbus",
+    name="moat-modbus",
     use_scm_version={"version_scheme": "guess-next-dev", "local_scheme": "dirty-tag"},
-    packages=["asyncmodbus"],
-    url="https://github.com/M-o-a-T/asyncmodbus",
+    packages=find_namespace_packages(include=['moat.*'])
+    url="https://github.com/M-o-a-T/moat.modbus",
     license="MIT",
     author="Matthias Urlichs",
     author_email="<matthias@urlichs.de>",
