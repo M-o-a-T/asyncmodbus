@@ -8,7 +8,10 @@ Homepage: https://github.com/M-o-a-T/asyncwebsockets
 
 Package: python3-moat-modbus
 Architecture: all
-Depends: ${misc:Depends}, ${python3:Depends}
+Depends: ${misc:Depends}, ${python3:Depends},
+  python3-moat-util,
+Recommends:
+  python3-moat-main,
 Description: An async modbus client/server library
  This is an anyio-enabled async frontend for pymodbus.
  .

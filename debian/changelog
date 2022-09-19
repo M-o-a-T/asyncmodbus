@@ -1,3 +1,9 @@
+moat-modbus (0.4.3-2) unstable; urgency=medium
+
+  * depend on util (and recommend main)
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Mon, 19 Sep 2022 17:27:30 +0200
+
 moat-modbus (0.4.3-1) unstable; urgency=medium
 
   * Merge
