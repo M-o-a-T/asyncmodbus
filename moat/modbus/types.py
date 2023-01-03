@@ -27,22 +27,22 @@ try:
     )
 except ImportError:
     from pymodbus.factory import (
-        ReadDiscreteInputsRequest,
-        ReadDiscreteInputsResponse,
         ReadCoilsRequest,
         ReadCoilsResponse,
+        ReadDiscreteInputsRequest,
+        ReadDiscreteInputsResponse,
         ReadHoldingRegistersRequest,
         ReadHoldingRegistersResponse,
         ReadInputRegistersRequest,
         ReadInputRegistersResponse,
-        WriteSingleCoilRequest,
-        WriteSingleCoilResponse,
         WriteMultipleCoilsRequest,
         WriteMultipleCoilsResponse,
-        WriteSingleRegisterRequest,
-        WriteSingleRegisterResponse,
         WriteMultipleRegistersRequest,
         WriteMultipleRegistersResponse,
+        WriteSingleCoilRequest,
+        WriteSingleCoilResponse,
+        WriteSingleRegisterRequest,
+        WriteSingleRegisterResponse,
     )
 
 import logging
@@ -69,6 +69,8 @@ class BaseValue:
     len = 0
     _value = None
     gen = 0
+    block: "DataBlock" = None
+    to_write: int = None
 
     def __init__(self, value=None, idem=False):
         self.changed = anyio.Event()
@@ -89,8 +91,18 @@ class BaseValue:
         # pylint: disable=missing-function-docstring
         self._value = self._constrain(val)
 
+    def set(self, val, idem: bool = True):
+        """Set the value. Triggers a write if changed (or @idem is False)."""
+        # pylint: disable=missing-function-docstring
+        val = self._constrain(val)
+        if not idem or (val is None) != (self._value is None) or self._value != val:
+            self._value = val
+            self.gen += 1
+            self.to_write = self.gen
+            if self.block is not None:
+                self.block.trigger_send()
+
     def _constrain(self, val):
-        # pylint: disable=no-self-use
         return val
 
     def _decode(self, regs):
@@ -146,7 +158,7 @@ class _Signed:
 
     def _decode(self, regs):
         res = super()._decode(regs)
-        if res & 1 << (self.len * 16 - 1):
+        if res & (1 << (self.len * 16 - 1)):
             res -= 1 << (self.len * 16)
         return res
 
@@ -237,6 +249,18 @@ class QuadValue(IntValue):
         )
 
 
+class BitValue(BaseValue):
+    """Bits, for "coil"s."""
+
+    len = 1
+
+    def _decode(self, regs):
+        return bool(regs[0])
+
+    def _encode(self, value):
+        return value
+
+
 class FloatValue(BaseValue):
     """network-ordered floating point."""
 
@@ -264,31 +288,31 @@ class DoubleValue(BaseValue):
 class SwappedLongValue(_Swapped, LongValue):
     """32-bit integer, two registers, little-endian word order."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 class SwappedQuadValue(_Swapped, QuadValue):
     """64-bit integer, four registers, little-endian word order."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 class SignedIntValue(_Signed, IntValue):
     """one register, signed."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 class SignedLongValue(_Signed, LongValue):
     """two registers, signed."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 class SwappedSignedLongValue(_Signed, _Swapped, BaseValue):
     """two registers, signed, swapped."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 SignedSwappedLongValue = SwappedSignedLongValue
@@ -297,13 +321,13 @@ SignedSwappedLongValue = SwappedSignedLongValue
 class SignedQuadValue(_Signed, QuadValue):
     """four registers, signed."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 class SwappedSignedQuadValue(_Signed, _Swapped, QuadValue):
     """four registers, signed, swapped."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 SignedSwappedQuadValue = SwappedSignedQuadValue
@@ -312,13 +336,60 @@ SignedSwappedQuadValue = SwappedSignedQuadValue
 class SwappedFloatValue(_Swapped, FloatValue):
     """broken-ordered floating point."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
 
 
 class SwappedDoubleValue(_Swapped, DoubleValue):
     """broken-ordered accurate floating point."""
 
-    pass  # pylint: disable=unnecessary-pass
+    pass
+
+
+class ByteValue(BaseValue):
+    """Bytestring. @length is in bytes"""
+
+    endian = ">"
+    len = -1
+
+    def __init__(self, length, *a, **kw):
+        self.len = (length + 1) // 2
+        self.pack = f"{self.endian}{self.len}H"
+
+        super().__init__(*a, **kw)
+
+    def _encode(self, value):
+        ln = self.len * 2
+        value += b"\0" * (ln - len(value))
+
+        return struct.unpack(self.pack, value)
+
+    def _decode(self, regs):
+        return struct.pack(self.pack, *regs)
+
+
+class SwappedByteValue(ByteValue):
+    """Bytes, null-terminated, little-endian words. @length is in bytes"""
+
+    endian = "<"
+
+
+class StringValue(ByteValue):
+    """Text, null-terminated.
+    @length is in bytes, NOT UTF-8 characters"""
+
+    def _encode(self, value):
+        value = value.encode("utf-8")
+        return super()._encode(value)
+
+    def _decode(self, regs):
+        return super()._decode(regs).rstrip(b"\0").decode("utf-8")
+
+
+class SwappedStringValue(StringValue):
+    """Text, null-terminated, little-endian words.
+    @length is in bytes, NOT UTF-8 characters"""
+
+    endian = "<"
 
 
 class TypeCodec:
@@ -414,6 +485,13 @@ class DataBlock(dict, BaseModbusDataBlock):
         for val in self.values():
             val.value = None
 
+    def trigger_send(self):
+        """Called by a value when it's been changed.
+
+        Currently a no-op in this class.
+        """
+        pass
+
     def add(self, offset: int, val: BaseValue):
         """Add a value to the block."""
         if offset in self:
@@ -433,6 +511,7 @@ class DataBlock(dict, BaseModbusDataBlock):
             except KeyError:
                 pass
         self[offset] = val
+        val.block = self
 
     def validate(self, address: int, count: int = 1):
         """Test whether @count elements exist at @address."""
@@ -449,14 +528,19 @@ class DataBlock(dict, BaseModbusDataBlock):
             count -= val.len
         return True
 
-    def ranges(self):
-        """Iterate over to-be-retrieved range(s)."""
+    def ranges(self, changed=False):
+        """Iterate over to-be-retrieved/sent range(s).
+
+        If @changed is set, skip unmodified items.
+        """
         start, cur = None, None
         for offset, val in sorted(self.items()):
             if isinstance(val, InaccessibleValue):
                 if start is not None:
                     yield (start, cur - start)
                     start = None
+            elif changed and val.to_write is None:
+                continue
             elif start is None:
                 start = offset
                 cur = start + val.len
@@ -470,8 +554,11 @@ class DataBlock(dict, BaseModbusDataBlock):
         if cur is not None:
             yield (start, cur - start)
 
-    def getValues(self, address: int, count=1):
-        """Get the array of Modbus values for the @address:+@count range"""
+    def getValues(self, address: int, count=1) -> List[int]:
+        """Returns the array of Modbus values for the @address:+@count range
+
+        Called when preparing a Send request.
+        """
         res = []
         while count > 0:
             try:
@@ -489,8 +576,30 @@ class DataBlock(dict, BaseModbusDataBlock):
             res = res[:count]
         return res
 
+    def markSent(self, address: int, count=1):
+        """Mark this range as sent: remember gen counter"""
+        while count > 0:
+            try:
+                val = self[address]
+            except KeyError:
+                address += 1
+                count -= 1
+            else:
+                if val.to_write is not None:
+                    if val.to_write == val.gen:
+                        val.to_write = None
+                    else:
+                        val.to_write = val.gen
+                        self.trigger_send()
+
+                address += val.len
+                count -= val.len
+
     def setValues(self, address: int, values: List[int]):
-        """Set the variables starting at @address to @values"""
+        """Set the variables starting at @address to @values.
+
+        Called with the reply of a Read request.
+        """
         while values:
             try:
                 val = self[address]
@@ -511,6 +620,8 @@ class DataBlock(dict, BaseModbusDataBlock):
         """
         while count:
             val = self.pop(address, None)
+            if val is not None:
+                val.block = None
             address += val.len
             count -= 1
 
@@ -534,6 +645,7 @@ class ValueIterator:
         if it's been cleared, raises `StopAsyncIteration`.
         """
         val = self.val
+
         if val.gen > 0 and val.value is None:
             raise StopAsyncIteration
         if self.gen == val.gen:

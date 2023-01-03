@@ -1,66 +1,29 @@
 #!/usr/bin/env python3
 """
-Basic tool support
+Basic "modbus" tool: network client and server, serial client
 
 """
+import logging  # pylint: disable=wrong-import-position
 from getopt import getopt
+from pprint import pprint
 
 import asyncclick as click
 
-from moat.modbus.types import (
-    Coils,
-    DiscreteInputs,
-    DoubleValue,
-    FloatValue,
-    HoldingRegisters,
-    InputRegisters,
-    IntValue,
-    LongValue,
-    QuadValue,
-    SignedIntValue,
-    SignedLongValue,
-    SignedQuadValue,
-    SwappedDoubleValue,
-    SwappedFloatValue,
-    SwappedLongValue,
-    SwappedQuadValue,
-    SwappedSignedLongValue,
-    SwappedSignedQuadValue,
-)
+from .typemap import get_type, map_kind, map_type
+from .types import InputRegisters, IntValue
 
-map_kind = {"c": Coils, "d": DiscreteInputs, "h": HoldingRegisters, "i": InputRegisters}
-map_type = {
-    "raw": IntValue,
-    "u1": IntValue,
-    "U1": IntValue,
-    "u2": LongValue,
-    "U2": SwappedLongValue,
-    "u4": QuadValue,
-    "U4": SwappedQuadValue,
-    "s1": SignedIntValue,
-    "S1": SignedIntValue,
-    "s2": SignedLongValue,
-    "S2": SwappedSignedLongValue,
-    "s4": SignedQuadValue,
-    "S4": SwappedSignedQuadValue,
-    "f2": FloatValue,
-    "F2": SwappedFloatValue,
-    "f4": DoubleValue,
-    "F4": SwappedDoubleValue,
-}
-
-import logging  # pylint: disable=wrong-import-position
-
-FORMAT = "%(asctime)-15s %(threadName)-15s %(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s"
-logging.basicConfig(format=FORMAT)
 log = logging.getLogger()
-log.setLevel(logging.WARN)
 
 
 @click.group()
 async def main():
     """Modbus client / server"""
-    pass  # pylint: disable=unnecessary-pass
+
+    FORMAT = (
+        "%(asctime)-15s %(threadName)-15s %(levelname)-8s %(module)-15s:%(lineno)-8s %(message)s"
+    )
+    logging.basicConfig(format=FORMAT)
+    log.setLevel(logging.WARN)
 
 
 UNIT = 0x1
@@ -92,19 +55,7 @@ Types:
 """
 
 
-@main.command(
-    context_settings=dict(
-        show_default=True,
-        ignore_unknown_options=True,
-        help_option_names=["-?", "--help"],
-    ),
-    epilog=_args_help,
-)
-@click.option("--host", "-s", default="localhost", help="host to bind to")
-@click.option("--port", "-p", type=int, default=502, help="port to bind to")
-@click.option("--debug", "-d", is_flag=True, help="Log debug messages")
-@click.argument("args", nargs=-1, type=click.UNPROCESSED)
-async def server(host, port, debug, args):
+async def _server(host, port, debug, args):
     """
     Basic Modbus server, for static tests.
     """
@@ -134,7 +85,7 @@ async def server(host, port, debug, args):
         elif k in ("-k", "--kind"):
             kind = map_kind[v[0]]
         elif k in ("-t", "--type"):
-            typ = map_type[v[0]]
+            typ = get_type(v[0])
         elif k in ("-r", "--reg", "--register"):
             reg = int(v)
         elif k in ("-n", "--num"):
@@ -158,6 +109,28 @@ async def server(host, port, debug, args):
     await s.serve()
 
 
+def mk_server(m):
+    """Helper to create a server"""
+    s = _server
+    s = click.argument("args", nargs=-1, type=click.UNPROCESSED)(s)
+    s = click.option("--debug", "-d", is_flag=True, help="Log debug messages")(s)
+    s = click.option("--port", "-p", type=int, default=502, help="port to bind to")(s)
+    s = click.option("--host", "-s", default="localhost", help="host to bind to")(s)
+    s = m.command(
+        "server",
+        context_settings=dict(
+            show_default=True,
+            ignore_unknown_options=True,
+            help_option_names=["-?", "--help"],
+        ),
+        epilog=_args_help,
+    )(s)
+    return s
+
+
+server = mk_server(main)
+
+
 def flint(v):
     """float-or-int"""
     try:
@@ -166,23 +139,7 @@ def flint(v):
         return float(v)
 
 
-@main.command(context_settings=dict(show_default=True))
-@click.option("--host", "-h", default="localhost", help="destination host")
-@click.option("--port", "-p", type=int, default=502, help="destination port")
-@click.option("--unit", "-u", type=int, default=1, help="unit to query")
-@click.option("--kind", "-k", default="i", help="query type: input, discrete, hold, coil")
-@click.option("--start", "-s", default=0, help="starting register")
-@click.option("--num", "-n", type=int, default=1, help="number of values")
-@click.option(
-    "--type",
-    "-t",
-    "type_",
-    default="raw",
-    help="value type: s1,s2,s4,u1,u2,u4,f2,f4,raw; Sx/Fx=swapped",
-)
-@click.option("--debug", "-d", is_flag=True, help="Log debug messages")
-@click.argument("values", nargs=-1)
-async def client(host, port, unit, kind, start, num, type_, values, debug):
+async def _client(host, port, unit, kind, start, num, type_, values, debug):
     """
     Basic Modbus-TCP client.
     """
@@ -191,13 +148,12 @@ async def client(host, port, unit, kind, start, num, type_, values, debug):
 
     from moat.modbus.client import ModbusClient  # pylint: disable=import-outside-toplevel
 
-    async with ModbusClient() as g:
-        h = g.host(host, port)
-        u = h.unit(unit)
-        s = u.slot("default")
+    async with ModbusClient() as g, g.host(host, port) as h, h.unit(unit) as u, u.slot(
+        "default"
+    ) as s:
 
         k = map_kind[kind[0]]
-        t = map_type[type_]
+        t = get_type(type_)
         if values:
             if len(values) == 1:
                 values = values * num
@@ -212,12 +168,107 @@ async def client(host, port, unit, kind, start, num, type_, values, debug):
 
         try:
             if values:
-                await s.setValues()
+                await s._setValues()  # pylint:disable=protected-access  ## TODO
             else:
-                res = await s.getValues()
-                print(res)
+                res = await s._getValues()  # pylint:disable=protected-access  ## TODO
+                pprint(res)
         except Exception as exc:  # pylint: disable=broad-except
             log.exception("Problem: %r", exc)
+
+
+def mk_client(m):
+    """helper to create a client"""
+    c = _client
+    c = click.argument("values", nargs=-1)(c)
+    c = click.option("--debug", "-d", is_flag=True, help="Log debug messages")(c)
+    c = click.option(
+        "--type",
+        "-t",
+        "type_",
+        default="raw",
+        help="value type: s1,s2,s4,u1,u2,u4,f2,f4,raw; Sx/Fx=swapped",
+    )(c)
+    c = click.option("--num", "-n", type=int, default=1, help="number of values")(c)
+    c = click.option("--start", "-s", default=0, help="starting register")(c)
+    c = click.option("--kind", "-k", default="i", help="query type: input, discrete, hold, coil")(
+        c
+    )
+    c = click.option("--unit", "-u", type=int, default=1, help="unit to query")(c)
+    c = click.option("--port", "-p", type=int, default=502, help="destination port")(c)
+    c = click.option("--host", "-h", default="localhost", help="destination host")(c)
+    c = m.command("client", context_settings=dict(show_default=True))(c)
+    return c
+
+
+client = mk_client(main)
+
+
+async def _serclient(
+    port, baudrate, stopbits, parity, unit, kind, start, num, type_, values, debug
+):
+    """
+    Basic Modbus-RTU client.
+    """
+    if debug:
+        log.setLevel(logging.DEBUG)
+
+    from moat.modbus.client import ModbusClient  # pylint: disable=import-outside-toplevel
+
+    async with ModbusClient() as g, g.serial(
+        port=port, baudrate=baudrate, stopbits=stopbits, parity=parity
+    ) as h, h.unit(unit) as u, u.slot("default") as s:
+
+        k = map_kind[kind[0]]
+        t = get_type(type_)
+        if values:
+            if len(values) == 1:
+                values = values * num
+            elif len(values) != num:
+                raise click.UsageError("One or N values!")
+        for i in range(num):
+            v = s.add(k, start, t)
+            if values:
+                v.value = flint(values[i])
+            start += t.len
+            num -= 1
+
+        try:
+            if values:
+                await s._setValues()  # pylint:disable=protected-access  ## TODO
+            else:
+                res = await s._getValues()  # pylint:disable=protected-access  ## TODO
+                pprint(res)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Problem: %r", exc)
+
+
+def mk_serial_client(m):
+    """helper to create a sserial client"""
+    c = _serclient
+    c = click.argument("values", nargs=-1)(c)
+    c = click.option("--debug", "-d", is_flag=True, help="Log debug messages")(c)
+    c = click.option(
+        "--type",
+        "-t",
+        "type_",
+        default="raw",
+        help="value type: s1,s2,s4,u1,u2,u4,f2,f4,raw; Sx/Fx=swapped",
+    )(c)
+    c = click.option("--num", "-n", type=int, default=1, help="number of values")(c)
+    c = click.option("--start", "-s", default=0, help="starting register")(c)
+    c = click.option("--kind", "-k", default="i", help="query type: input, discrete, hold, coil")(
+        c
+    )
+    c = click.option("--unit", "-u", type=int, default=1, help="unit to query")(c)
+    c = click.option("--port", "-p", type=str, help="destination port (/dev/ttyXXX)")(c)
+    c = click.option("--baudrate", "-b", type=int, default=9600, help="Baud rate (9600)")(c)
+    c = click.option("--parity", "-P", type=str, default="N", help="Parity (NEO), default N")(c)
+    c = click.option("--stopbits", "-S", type=int, default=1, help="Stopbits (12), default 1")(c)
+    c = m.command("serial", context_settings=dict(show_default=True))(c)
+    return c
+
+
+serialclient = mk_serial_client(main)
 
 
 if __name__ == "__main__":
