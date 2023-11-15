@@ -10,6 +10,7 @@ import asyncclick as click
 from moat.util import load_subgroup
 
 from moat.modbus.client import ModbusClient
+from moat.modbus.server import RelayServer, SerialModbusServer
 
 from .__main__ import add_serial_cfg, mk_client, mk_serial_client, mk_server
 
@@ -32,28 +33,45 @@ def print_exc(exc, **kw):  # pylint: disable=missing-function-docstring
 
 @cli.group(invoke_without_command=True)
 @add_serial_cfg
+@click.option("-t", "--timeout", type=float, default=0, help="Error if no more data (seconds)")
+@click.option(
+    "-T", "--initial-timeout", "timeout1", type=float, default=0, help="Error if no data (seconds)"
+)
 @click.pass_context
-async def monitor(ctx, **params):
+async def monitor(ctx, timeout, timeout1, **params):
     """
     A basic Modbus RTU monitor.
 
-    This command simply shows the messages on a Modbus RTU line.
+    This command dumps the messages on a Modbus RTU line.
+
+    The arguments address the link to the server, i.e. it acts as a Modbus client.
+    You need to add a "to" subcommand with the connection that should act as
+    the server, i.e. which the actual client is connected to.
+
+    Otherwise this is TODO, as distinguishing client
+    and server messages is somewhat nontrivial.
+
     """
     obj = ctx.obj
 
     if ctx.invoked_subcommand is not None:
         obj.A = params
+        obj.timeout = timeout
+        obj.timeout1 = timeout1
         return
 
-    async def mon(msg):
-        print(msg)
+    raise click.UsageError("Single line monitoring is not implemented yet")
 
-    async with ModbusClient() as g, g.serial(monitor=mon, **params) as h:
-        g, h  # pylint: disable=pointless-statement
-        if obj.debug > 1:
-            print("Listening.", file=sys.stderr)
-        while True:
-            await anyio.sleep(99999)
+
+#   async def mon(msg):
+#       print(msg)
+
+#   async with ModbusClient() as g, g.serial(monitor=mon, **params) as h:
+#       g, h  # pylint: disable=pointless-statement
+#       if obj.debug > 1:
+#           print("Listening.", file=sys.stderr)
+#       while True:
+#           await anyio.sleep(99999)
 
 
 @monitor.command
@@ -62,40 +80,49 @@ async def monitor(ctx, **params):
 @click.pass_obj
 async def to(obj, retry, **params):
     """
-    Tells the monitor to relay between two RTU devices.
+    This subcommand describes the ModBus interface with the client(s).
 
     Useful for reverse engineering, serial speed/format translation, debugging …
     """
     A = None
     B = None
-    n_A = 0
-    n_B = 0
 
-    async def mon_A(msg):
-        print("A:", msg)
-        await B.send(msg)
+    class Server(RelayServer, SerialModbusServer):
+        """A time-out-ing serial Modbus relay"""
 
-        nonlocal n_A
-        n_A += 1
+        def __init__(self, *a, **kw):
+            self.__evt = anyio.Event()
+            super().__init__(*a, **kw)
 
-    async def mon_B(msg):
-        print("B:", msg)
-        await A.send(msg)
+        def mon_request(self, request):
+            "request monitor"
+            print(f"> {request}")
 
-        nonlocal n_B
-        n_B += 1
+        def mon_response(self, response):
+            "response monitor"
+            print(f"< {response}")
+            self.__evt.set()
+
+        async def watch(self, t2, t1):
+            "Timeout manager"
+            t = t1
+            while True:
+                if t is None:
+                    await self.__evt.wait()
+                else:
+                    with anyio.fail_after(t):
+                        await self.__evt.wait()
+                t = t2
+                self.__evt = anyio.Event()
 
     while True:
-        n_A = 0
-        n_B = 0
         try:
-            async with ModbusClient() as g_a, g_a.serial(
-                monitor=mon_A, **obj.A
-            ) as A, ModbusClient() as g_b, g_b.serial(monitor=mon_B, **params) as B:
-                while True:
-                    await anyio.sleep(99999)
+            async with ModbusClient() as g_a, g_a.serial(**obj.A) as A, Server(
+                client=A, **params
+            ) as B, anyio.create_task_group() as tg:
+                await B.watch(obj.timeout, obj.timeout1)
         except Exception as exc:  # pylint: disable=broad-exception-caught
-            if not retry or not n_A or not n_B:
+            if not retry or not A or not B:
                 raise
             print_exc(exc, file=sys.stderr)
             print(f"Retrying in {retry}s", file=sys.stderr)
