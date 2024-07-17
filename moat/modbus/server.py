@@ -9,6 +9,7 @@ import socket
 from binascii import b2a_hex
 from contextlib import asynccontextmanager
 from typing import Type, Union
+import time
 
 import anyio
 from anyio.abc import SocketAttribute
@@ -18,7 +19,7 @@ from pymodbus.datastore import ModbusServerContext, ModbusSlaveContext
 from pymodbus.device import ModbusControlBlock, ModbusDeviceIdentification
 from pymodbus.exceptions import NoSuchSlaveException
 from pymodbus.factory import ServerDecoder
-from pymodbus.pdu import ModbusExceptions as merror
+from pymodbus.pdu import ModbusExceptions as merror, ExceptionResponse
 from pymodbus.utilities import hexlify_packets
 
 from moat.modbus.types import BaseValue, DataBlock, TypeCodec
@@ -32,7 +33,7 @@ class UnitContext(ModbusSlaveContext):
     individual variables.
     """
 
-    def __init__(self, server, unit):
+    def __init__(self, server=None, unit=None):
         super().__init__(
             di=DataBlock(),
             co=DataBlock(),
@@ -40,8 +41,9 @@ class UnitContext(ModbusSlaveContext):
             hr=DataBlock(),
             zero_mode=True,
         )
-        self.unit = unit
-        server._add_unit(self)
+        if server:
+            self.unit = unit
+            server._add_unit(self)
 
     def add(
         self, typ: TypeCodec, offset: int, val: Union[BaseValue, Type[BaseValue]]
@@ -96,7 +98,7 @@ class BaseModbusServer(CtxObj):
             identity.MajorMinorRevision = "1.0"
         self.identity = identity
 
-    def add_unit(self, unit) -> UnitContext:
+    def add_unit(self, unit, ctx=None) -> UnitContext:
         """
         Add an empty unit (= slave context) to this server (and return it).
 
@@ -104,7 +106,9 @@ class BaseModbusServer(CtxObj):
         """
         if unit in self.units:
             raise RuntimeError(f"Unit {unit} already exists")
-        return UnitContext(self, unit)
+        if ctx is None:
+            return UnitContext(self, unit)
+        self.units[unit] = ctx
 
     def _add_unit(self, unit):
         self.units[unit.unit] = unit
@@ -114,9 +118,12 @@ class BaseModbusServer(CtxObj):
         raise RuntimeError("You need to override .serve")
 
     async def process_request(self, request):
-        """Basic async request processor"""
+        """Basic request processor"""
         context = self.context[request.unit_id]
-        response = request.execute(context)
+        if hasattr(context, "process_request"):
+            response = await context.process_request(request)
+        else:
+            response = request.execute(context)
         return response
 
     @asynccontextmanager
@@ -141,16 +148,20 @@ class SerialModbusServer(BaseModbusServer):
     ignore_missing_slaves = False
     single = False
 
-    def __init__(self, identity=None, **args):
+    def __init__(self, identity=None, timeout=None, **args):
         super().__init__(identity=identity)
         self.args = args
+        self.timeout = timeout
 
         from pymodbus.framer.rtu_framer import (  # pylint: disable=import-outside-toplevel
             ModbusRtuFramer,
         )
+        class Framer(ModbusRtuFramer):
+            def _validate_unit_id(self, unit, single):
+                return True
 
         self.decoder = ServerDecoder()  # pylint: disable=no-value-for-parameter ## duh?
-        self.Framer = ModbusRtuFramer
+        self.Framer = Framer
 
     async def serve(self, opened=None):
         from anyio_serial import Serial  # pylint: disable=import-outside-toplevel
@@ -161,20 +172,31 @@ class SerialModbusServer(BaseModbusServer):
 
             if opened is not None:
                 opened.set()
+            t = time.monotonic()
             while True:
-                data = await ser.receive()
+                with anyio.move_on_after(0.1):
+                    await ser.receive()
+                    break
+            while True:
+                if self.timeout:
+                    with anyio.fail_after(self.timeout):
+                        data = await ser.receive()
+                else:
+                    data = await ser.receive()
+                t2 = time.monotonic()
+                if t2-t > 0.2:
+                    self.framer.resetFrame()
+                t = t2
                 msgs = []
-                self.framer.processIncomingPacket(
-                    data=data,
-                    callback=msgs.append,
-                    unit=self.units,
-                    single=self.single,
-                )
+                self.framer.processIncomingPacket(data=data, unit=0, callback=msgs.append, single=True)
                 for msg in msgs:
-                    await self._process(msg)
+                    with anyio.fail_after(2):
+                        await self._process(msg)
 
     async def _process(self, request):
         broadcast = False
+        unit = request.unit_id
+        tid = request.transaction_id
 
         try:
             if self.broadcast_enable and not request.unit_id:
@@ -195,7 +217,12 @@ class SerialModbusServer(BaseModbusServer):
             _logger.exception("Unable to fulfill request")
             response = request.doException(merror.SlaveFailure)
         # no response when broadcasting
-        if request.should_respond and not broadcast:
+        response.unit_id = unit
+        response.transaction_id = tid
+        if isinstance(response,ExceptionResponse):
+            _logger.error("Source: %r %d %d %d", type(request), request.function_code, request.address, getattr(request,"count",1))
+
+        if response.should_respond and not broadcast:
             response.transaction_id = request.transaction_id
             response.unit_id = request.unit_id
             skip_encoding = False
@@ -203,15 +230,15 @@ class SerialModbusServer(BaseModbusServer):
                 response, skip_encoding = self.response_manipulator(response)
             if not skip_encoding:
                 response = self.framer.buildPacket(response)
-            if _logger.isEnabledFor(logging.DEBUG):
-                _logger.debug("send: [%s]- %s", request, b2a_hex(response))
+#           if _logger.isEnabledFor(logging.DEBUG):
+#               _logger.debug("send: [%s]- %s", request, b2a_hex(response))
 
             await self._serial.send(response)
 
 
 class RelayServer:
     """
-    A mix-in class for servers that forwards to a client
+    A mix-in class to teach a server to forward all requests to a client
     """
 
     single = True
@@ -221,22 +248,22 @@ class RelayServer:
         super().__init__(*a, **k)
 
     async def _process(self, request):
-        self.mon_request(request)
+        request = self.mon_request(request)
         tid = request.transaction_id
-        r = await self._client.execute(request)
+        resp = await self._client.execute(request)
 
-        r.transaction_id = tid
-        self.mon_response(r)
-        r = self.framer.buildPacket(r)  # pylint:disable=no-member
-        await self._serial.send(r)  # pylint:disable=no-member
+        resp.transaction_id = tid
+        resp = self.mon_response(resp) or resp
+        resp = self.framer.buildPacket(resp)  # pylint:disable=no-member
+        await self._serial.send(resp)  # pylint:disable=no-member
 
     def mon_request(self, request):
         """Request monitor. Override me."""
-        pass
+        return request
 
     def mon_response(self, response):
         """Response monitor. Override me."""
-        pass
+        return response
 
 
 class ModbusServer(BaseModbusServer):
@@ -267,7 +294,7 @@ class ModbusServer(BaseModbusServer):
             port if port is not None else Defaults.Port  # pylint: disable=no-member  # YES IT DOES
         )
 
-    async def serve(self, opened=None):
+    async def serve(self, opened:anyio.Event|None=None):
         """Run this server.
         Sets the `opened` event, if given, as soon as the server port is open.
         """
@@ -309,11 +336,11 @@ class ModbusServer(BaseModbusServer):
 
                 reqs = []
                 # TODO fix pymodbus
-                framer.processIncomingPacket(
-                    data, reqs.append, list(self.units.keys()), single=self.single
-                )
+                framer.processIncomingPacket(data, unit=0, callback=reqs.append, single=True)
 
                 for request in reqs:
+                    unit = request.unit_id
+                    tid = request.transaction_id
                     try:
                         response = await self.process_request(request)
                     except NoSuchSlaveException:
@@ -323,8 +350,8 @@ class ModbusServer(BaseModbusServer):
                         _logger.warning("Datastore unable to fulfill request", exc_info=exc)
                         response = request.doException(merror.SlaveFailure)
                     if response.should_respond:
-                        response.transaction_id = request.transaction_id
-                        response.unit_id = request.unit_id
+                        response.transaction_id = tid
+                        response.unit_id = unit
                         # self.server.control.Counter.BusMessage += 1
                         pdu = framer.buildPacket(response)
                         if _logger.isEnabledFor(logging.DEBUG):
@@ -354,41 +381,3 @@ class MockAioModbusServer(ModbusServer):
     """A test modbus server with static data"""
 
     pass
-
-
-class ForwardingAioModbusServer:
-    """A modbus server mix-in that forwards requests to a modbus client"""
-
-    def __init__(self):
-        self._units = {}
-
-    def add_unit(self, unit):  # pylint: disable=missing-function-docstring
-        """Use 'set_forward' with a forwarding server instead of this method."""
-        raise RuntimeError("Use 'set_forward' with a forwarding server")
-
-    def set_forward(
-        self, id, unit: ModbusSlaveContext = None
-    ):  # pylint: disable=redefined-builtin
-        """Arrange for requests to the given ID to be forwarded
-        to this client.
-
-        Use unit=None to stop forwarding.
-        """
-        if unit is None:
-            del self._units[id]
-        else:
-            self._units[id] = unit
-
-    async def process_request(self, request):
-        """Process this request by forwarding it to the client."""
-        old_unit = request.unit_id
-        old_tid = request.transaction_id
-
-        unit = self._units[request.unit_id]
-        request.unit_id = unit.unit
-        try:
-            async with unit.concurrent_requests:
-                return await unit.host.execute(request)
-        finally:
-            request.unit_id = old_unit
-            request.transaction_id = old_tid

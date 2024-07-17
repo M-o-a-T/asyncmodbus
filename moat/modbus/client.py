@@ -15,11 +15,12 @@ from anyio import ClosedResourceError, IncompleteRead
 from anyio.abc import SocketAttribute
 from anyio_serial import Serial
 from asyncscope import scope
-from moat.util import CtxObj, Queue, ValueEvent, id36
+from moat.util import CtxObj, Queue, ValueEvent, num2id
 from pymodbus.exceptions import ModbusIOException
 from pymodbus.factory import ClientDecoder
 from pymodbus.framer.rtu_framer import ModbusRtuFramer
 from pymodbus.framer.socket_framer import ModbusSocketFramer
+from pymodbus.pdu import ModbusExceptions as merror
 
 from .types import BaseValue, DataBlock, TypeCodec
 
@@ -80,7 +81,7 @@ class ModbusClient(CtxObj):
         """Run a TCP client in an AsyncScope."""
         if not port:
             port = 502
-        return await scope.service(f"MC_{id36(self)}:{addr}:{port}", self._host, addr, port)
+        return await scope.service(f"MC_{num2id(self)}:{addr}:{port}", self._host, addr, port)
 
     def serial(self, /, port, **ser):
         """Return a host object for connections to this serial port."""
@@ -97,7 +98,7 @@ class ModbusClient(CtxObj):
 
     async def serial_service(self, port, **ser):
         """Run a serial client in an AsyncScope."""
-        return await scope.service(f"MC_{id36(self)}:{port}", self._serial, port, **ser)
+        return await scope.service(f"MC_{num2id(self)}:{port}", self._serial, port, **ser)
 
 
 class ModbusError(RuntimeError):
@@ -143,7 +144,7 @@ class _HostCommon:
 
     async def unit_scope(self, unit):
         """Run a unit in an `AsyncScope`"""
-        return await scope.service(f"MH_{id36(self)}:{unit}", self._unit, unit)
+        return await scope.service(f"MH_{num2id(self)}:{unit}", self._unit, unit)
 
     def _nextTID(self):
         self._tid = (self._tid + 1) % 0xFFFF
@@ -183,10 +184,7 @@ class _HostCommon:
                 await self.send(request)
                 with anyio.fail_after(self.timeout):
                     res = await request._response_value.get()
-            except TimeoutError:
-                await self.stream.aclose()
-                raise
-            else:
+
                 if res.isError():
                     raise ModbusError(res)
 
@@ -571,7 +569,7 @@ class Unit(CtxObj):
 
     async def slot_scope(self, slot, **kw):
         """Run the slot handler in an AsyncScope."""
-        return await scope.service(f"MS_{id36(self)}:{slot}", self._slot, slot, **kw)
+        return await scope.service(f"MS_{num2id(self)}:{slot}", self._slot, slot, **kw)
 
     async def aclose(self):
         """Stop talking and delete yourself.
@@ -586,6 +584,19 @@ class Unit(CtxObj):
         s, self.slots = self.slots, None
         for slot in s.values():
             await slot.aclose()
+
+    async def process_request(self, request):
+        """
+        Forward a request to the host.
+        """
+        request.unit_id = self.unit
+        try:
+            response = await self.host.execute(request)
+        except Exception as exc:
+            logger.exception("Handler for %d: %r", unit_id, exc)
+            response = request.doException(merror.SlaveFailure)
+
+        return response
 
 
 class Slot(CtxObj):
@@ -610,7 +621,8 @@ class Slot(CtxObj):
     for possible collation.
     """
 
-    _run_scope = None
+    _get_scope = None
+    _set_scope = None
     delay: float = None
     t_read = None
     _scope = None
@@ -688,7 +700,7 @@ class Slot(CtxObj):
                 return False
         return True
 
-    def add(self, typ: TypeCodec, offset: int, cls: Type[BaseValue]) -> BaseValue:
+    def add(self, typ: TypeCodec, offset: int, cls: Type[BaseValue] | BaseValue) -> BaseValue:
         """Add a field to this slot.
 
         :param typ: The `TypeCodec` instance to use.
@@ -720,8 +732,10 @@ class Slot(CtxObj):
         return k.delete(offset)
 
     async def _stop_run(self):
-        if self._run_scope is not None:
-            await self._run_scope.cancel()
+        if self._get_scope is not None:
+            await self._get_scope.cancel()
+        if self._set_scope is not None:
+            await self._set_scope.cancel()
 
     def close(self):
         """
@@ -747,9 +761,9 @@ class Slot(CtxObj):
                 rr.update(r)
 
             async with anyio.create_task_group() as tg:
-                if self._run_scope is not None:
+                if self._get_scope is not None:
                     raise RuntimeError("already running")
-                self._run_scope = tg.cancel_scope
+                self._get_scope = tg.cancel_scope
 
                 for typ, vl in self.modes.items():
                     res[typ] = r = {}
@@ -762,7 +776,7 @@ class Slot(CtxObj):
                 raise ClosedResourceError("dropped while running")
             return res
         finally:
-            self._run_scope = None
+            self._get_scope = None
 
     async def _setValues(self, changed=False):
         """
@@ -770,16 +784,16 @@ class Slot(CtxObj):
         """
         try:
             async with anyio.create_task_group() as tg:
-                if self._run_scope is not None:
+                if self._set_scope is not None:
                     raise RuntimeError("already running")
-                self._run_scope = tg.cancel_scope
+                self._set_scope = tg.cancel_scope
 
                 for vl in self.modes.values():
                     tg.start_soon(vl.writeValues, changed)
             if self.unit is None:
                 raise ClosedResourceError("dropped while running")
         finally:
-            self._run_scope = None
+            self._set_scope = None
 
     async def read(self):
         """Read this slot's data."""
@@ -856,9 +870,13 @@ class Slot(CtxObj):
         await self.run_lock.wait()
         while True:
             await self.write_trigger.wait()
-            await anyio.sleep(self.write_delay)
+            await anyio.sleep(1) # self.write_delay)
             self.write_trigger = anyio.Event()
-            await self.write(changed=True)
+            try:
+                await self.write(changed=True)
+            except ModbusError as exc:
+                _logger.exception("Write %s", self)
+                # TODO examine+record the error
 
 
 class ValueList(DataBlock):

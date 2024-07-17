@@ -10,13 +10,12 @@ from asyncscope import scope
 from moat.util import attrdict, merge, to_attrdict
 
 from ..client import ModbusClient
-from .device import Device, fixup
-from .server import Server
+from .device import ServerDevice, ClientDevice, fixup
+from ..server import ModbusServer, SerialModbusServer
 
 logger = logging.getLogger(__name__)
 
-
-async def dev_poll(cfg, dkv, *, task_status=None):
+async def dev_poll(cfg, mt_kv, *, task_status=None):
     """
     Run a device task on this set of devices, as configured by the config.
 
@@ -43,77 +42,108 @@ async def dev_poll(cfg, dkv, *, task_status=None):
 
             logger.info("Starting %r", vs)
 
-            dev = Device(client=cl, factory=Reg)
-            dev.load(data=v)
+            dev = ClientDevice(client=cl, factory=Reg)
+            await dev.load(data=v)
 
             return await scope.spawn_service(dev.as_scope)
 
-        async with anyio.create_task_group() as tg:
-            if dkv is None:
-                from .device import Register as Reg  # pylint: disable=import-outside-toplevel
+        if mt_kv is None:
+            from .device import Register as Reg  # pylint: disable=import-outside-toplevel
+            RegS = Reg
+        else:
+            # The MoaT-KV client must live longer than the taskgroup
+            from .kv import Register  # pylint: disable=import-outside-toplevel
+
+            Reg = partial(Register, mt_kv=mt_kv, tg=tg)  # noqa: F811
+            RegS = partial(Register, mt_kv=mt_kv, tg=tg, is_server=True)  # noqa: F811
+
+        # relay-out server(s)
+        servers = []
+        for s in cfg.get("server", ()):
+            if "serial" in s:
+                port = s.get("port", None)
+                kw = s["serial"]
+                if port is not None:
+                    kw["port"] = port
+                srv = SerialModbusServer(**kw)
+            elif "host" in s or ("port" in s and isinstance(s["port"],int)):
+                kw = {}
+                for k,v in s.items():
+                    if isinstance(k,str):
+                        if k == "units":
+                            continue
+                        if k == "host":
+                            k = "address"
+                        kw[k] = v
+                srv = ModbusServer(**kw)
             else:
-                # The DistKV client must live longer than the taskgroup
-                from .distkv import Register  # pylint: disable=import-outside-toplevel
+                raise ValueError("neither serial nor TCP config found")
+            servers.append(srv)
 
-                Reg = partial(Register, dkv=dkv, tg=tg)  # noqa: F811
+            for u,v in s.get("units",{}).items():
+                dev = ServerDevice(factory=RegS)
+                await dev.load(data=v)
+                srv.add_unit(u, dev)
+                nd += 1
 
-            servers = []
-            for s in cfg.get("server", ()):
-                servers.append(Server(**s))
 
-            for h, hv in cfg.get("ports", {}).items():
-                try:
-                    sp = hv["serial"]
-                except KeyError:
-                    logger.error("No serial params for port %r", h)
+        def do_attach(v, dev):
+            p = v.get("server", None)
+            if p is None:
+                return
+            if isinstance(p,int):
+                s,u = servers[p//1000],p%1000
+            else:
+                s,u = servers[p[0]],p[1]
+            s.add_unit(u, dev.unit)
+
+            nonlocal nd
+            nd += 1
+
+        # serial clients
+        for h, hv in cfg.get("ports", {}).items():
+            try:
+                sp = hv["serial"]
+            except KeyError:
+                logger.error("No serial params for port %r", h)
+                continue
+            for u, v in hv.items():
+                if not isinstance(u, int):
                     continue
-                for u, v in hv.items():
-                    if not isinstance(u, int):
-                        continue
-                    dev = await make_dev(v, Reg, port=h, serial=sp, unit=u)
-                    nd += 1
+                dev = await make_dev(v, Reg, port=h, serial=sp, unit=u)
+                tg.start_soon(dev.poll)
+                do_attach(v,dev)
+
+        # TCP clients
+        for h, hv in cfg.get("hosts", {}).items():
+            for u, v in hv.items():
+                if not isinstance(u, int):
+                    continue
+                dev = await make_dev(v, Reg, host=h, unit=u)
+                tg.start_soon(dev.poll)
+                do_attach(v,dev)
+
+        # more TCP clients
+        for h, hv in cfg.get("hostports", {}).items():
+            for p, pv in hv.items():
+                if not isinstance(p, int):
+                    continue
+                for u, v in pv.items():
+                    dev = await make_dev(v, Reg, host=h, port=p, unit=u)
                     tg.start_soon(dev.poll)
+                    do_attach(v,dev)
 
-                    us = v.get("server", None)
-                    if us is not None:
-                        srv = servers[us // 1000]
-                        us %= 1000
-                        srv.attach(us, dev.unit)
+        for s in servers:
+            evt = anyio.Event()
+            tg.start_soon(partial(s.serve, opened=evt))
+            await evt.wait()
 
-            for h, hv in cfg.get("hosts", {}).items():
-                for u, v in hv.items():
-                    if not isinstance(u, int):
-                        continue
-                    dev = await make_dev(v, Reg, host=h, unit=u)
-                    nd += 1
-                    tg.start_soon(dev.poll)
+        if task_status is not None:
+            task_status.started(cfg)
 
-                    us = v.get("server", None)
-                    if us is not None:
-                        srv = servers[us // 1000]
-                        us %= 1000
-                        srv.attach(us, dev.unit)
-
-            for h, hv in cfg.get("hostports", {}).items():
-                for p, pv in hv.items():
-                    if not isinstance(p, int):
-                        continue
-                    for u, v in pv.items():
-                        dev = await make_dev(v, Reg, host=h, port=p, unit=u)
-                        tg.start_soon(dev.poll)
-                        nd += 1
-
-                        us = v.get("server", None)
-                        if us is not None:
-                            srv = servers[us // 1000]
-                            us %= 1000
-                            srv.attach(us, dev.unit)
-
-            for s in servers:
-                tg.start_soon(s.run)
-
-            if task_status is not None:
-                task_status.started(cfg)
-
+        if nd:
+            logger.info("Running.")
         if not nd:
             logger.error("No devices to poll found.")
+
+        pass  # wait until all tasks are done

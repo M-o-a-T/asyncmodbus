@@ -8,6 +8,7 @@ from getopt import getopt
 from pprint import pprint
 
 import asyncclick as click
+import anyio
 
 from .typemap import get_type, map_kind, map_type
 from .types import InputRegisters, IntValue
@@ -139,7 +140,7 @@ def flint(v):
         return float(v)
 
 
-async def _client(host, port, unit, kind, start, num, type_, values, debug):
+async def _client(host, port, unit, kind, start, num, type_, values, debug, interval):
     """
     Basic Modbus-TCP client.
     """
@@ -148,9 +149,12 @@ async def _client(host, port, unit, kind, start, num, type_, values, debug):
 
     from moat.modbus.client import ModbusClient  # pylint: disable=import-outside-toplevel
 
-    async with ModbusClient() as g, g.host(host, port) as h, h.unit(unit) as u, u.slot(
-        "default"
-    ) as s:
+    async with (
+            ModbusClient() as g,
+            g.host(host, port) as h,
+            h.unit(unit) as u,
+            u.slot("default") as s,
+        ):
         k = map_kind[kind[0]]
         t = get_type(type_)
         if values:
@@ -161,18 +165,24 @@ async def _client(host, port, unit, kind, start, num, type_, values, debug):
         for i in range(num):
             v = s.add(k, start, t)
             if values:
-                v.value = flint(values[i])
+                v.set(flint(values[i]), idem=False)
             start += t.len
             num -= 1
 
-        try:
+        last_res = None
+        while True:
             if values:
                 await s._setValues()  # pylint:disable=protected-access  ## TODO
             else:
                 res = await s._getValues()  # pylint:disable=protected-access  ## TODO
-                pprint(res)
-        except Exception as exc:  # pylint: disable=broad-except
-            log.exception("Problem: %r", exc)
+                if last_res != res:
+                    pprint(res)
+                    last_res = res
+
+            if interval:
+                await anyio.sleep(interval)
+            else:
+                break
 
 
 def mk_client(m):
@@ -185,7 +195,7 @@ def mk_client(m):
         "-t",
         "type_",
         default="raw",
-        help="value type: s1,s2,s4,u1,u2,u4,f2,f4,raw; Sx/Fx=swapped",
+        help="value type: raw, s1,u2,f4, c#/b#:text/bytes, x/X:bool/inv; Sx/Fx=swapped",
     )(c)
     c = click.option("--num", "-n", type=int, default=1, help="number of values")(c)
     c = click.option("--start", "-s", default=0, help="starting register")(c)
@@ -195,6 +205,7 @@ def mk_client(m):
     c = click.option("--unit", "-u", type=int, default=1, help="unit to query")(c)
     c = click.option("--port", "-p", type=int, default=502, help="destination port")(c)
     c = click.option("--host", "-h", default="localhost", help="destination host")(c)
+    c = click.option("--interval", "-i", type=float, help="loop: read/write every N seconds")(c)
     c = m.command("client", context_settings=dict(show_default=True))(c)
     return c
 
