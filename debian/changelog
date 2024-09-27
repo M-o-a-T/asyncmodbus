@@ -1,3 +1,9 @@
+moat-modbus (0.8.0-1) unstable; urgency=medium
+
+  * Merge
+
+ -- Matthias Urlichs <matthias@urlichs.de>  Fri, 27 Sep 2024 11:43:15 +0200
+
 moat-modbus (0.7.2-2) unstable; urgency=medium
 
   * Kill testing (for now)

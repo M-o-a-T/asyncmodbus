@@ -22,7 +22,7 @@ from pymodbus.framer.rtu_framer import ModbusRtuFramer
 from pymodbus.framer.socket_framer import ModbusSocketFramer
 from pymodbus.pdu import ModbusExceptions as merror
 
-from .types import BaseValue, DataBlock, TypeCodec
+from .types import BaseValue, DataBlock, TypeCodec, MAX_REQ_LEN
 
 _logger = logging.getLogger(__name__)
 
@@ -35,7 +35,6 @@ __all__ = [
 DISCONNECT_DELAY = 0.1
 RECONNECT_TIMEOUT = 10
 CHECK_STREAM_TIMEOUT = 0.001
-
 
 class ModbusClient(CtxObj):
     """The main bus handler. Use as
@@ -59,7 +58,7 @@ class ModbusClient(CtxObj):
                 self._tg = None
                 self.hosts = {}
 
-    def host(self, addr, port=None):
+    def host(self, addr, port=None, **kw):
         """Return a host object for connections to this address+port.
 
         You cannot create two host objects for the same destination.
@@ -69,7 +68,7 @@ class ModbusClient(CtxObj):
         if (addr, port) in self.hosts:
             raise KeyError(f"Host {addr}:{port} already exists")
 
-        h = Host(self, addr, port)
+        h = Host(self, addr, port, **kw)
         return h
 
     async def _host(self, addr, port=None):
@@ -100,6 +99,37 @@ class ModbusClient(CtxObj):
         """Run a serial client in an AsyncScope."""
         return await scope.service(f"MC_{num2id(self)}:{port}", self._serial, port, **ser)
 
+    def conn(self, cfg):
+        """Run a serial OR TCP client according to the config.
+
+        @cfg is a dict with either host/port or port/serial keys.
+        Returns a host.
+
+        Usage::
+            async with ModbusClient() as g, g.conn(cfg) as c, c.unit(cfg["unit"]) as u:
+                ...
+        """
+        kw = {}
+        for k in ("max_rd_len", "max_wr_len"):
+            if k in cfg:
+                kw[k] = cfg[k]
+
+        if "serial" in cfg:
+            port = cfg.get("port", None)
+            kw.update(cfg["serial"])
+            if port is not None:
+                kw["port"] = port
+            return self.serial(**kw)
+
+        elif "host" in cfg or ("port" in cfg and isinstance(cfg["port"],int)):
+            for k in ("host","port"):
+                try:
+                    kw[k] = cfg[k]
+                except KeyError:
+                    pass
+            return self.host(**kw)
+        else:
+            raise ValueError("neither serial nor TCP config found")
 
 class ModbusError(RuntimeError):
     """Error entry in returned datasets"""
@@ -211,11 +241,12 @@ class Host(CtxObj, _HostCommon):
 
     _tg = None
 
-    max_req_len = 50  # max number of registers to fetch w/ one request
-
-    def __init__(self, gate, addr, port, timeout=10, cap=1, debug=False):
+    def __init__(self, gate, addr, port, timeout=10, cap=1, debug=False, max_rd_len=MAX_REQ_LEN, max_wr_len=MAX_REQ_LEN):
         self.addr = addr
         self.port = port
+
+        self.max_rd_len=max_rd_len
+        self.max_wr_len=max_wr_len
 
         log = logging.getLogger(f"modbus.{addr}")
         self._trace = log.info if debug else log.debug
@@ -291,7 +322,7 @@ class Host(CtxObj, _HostCommon):
                 replies = []
 
                 # check for decoding errors
-                self.framer.processIncomingPacket(data, replies.append, unit=0, single=True)  # bah
+                self.framer.processIncomingPacket(data, replies.append, slave=0, single=True)  # bah
 
             except (
                 IncompleteRead,
@@ -378,12 +409,12 @@ class SerialHost(CtxObj, _HostCommon):
 
     _tg = None
 
-    max_req_len = 50  # max number of registers to fetch w/ one request
-
-    def __init__(self, gate, /, port, timeout=10, cap=1, debug=False, monitor=None, **ser):
+    def __init__(self, gate, /, port, timeout=10, cap=1, debug=False, monitor=None, max_rd_len=MAX_REQ_LEN, max_wr_len=MAX_REQ_LEN, **ser):
         self.port = port
         self.ser = ser
         self.framer = ModbusRtuFramer(ClientDecoder(), self)
+        self.max_rd_len=max_rd_len
+        self.max_wr_len=max_wr_len
 
         log = logging.getLogger(f"modbus.{Path(port).name}")
         self._trace = log.info if debug else log.debug
@@ -450,7 +481,7 @@ class SerialHost(CtxObj, _HostCommon):
                 replies = []
 
                 # check for decoding errors
-                self.framer.processIncomingPacket(data, replies.append, unit=0, single=True)  # bah
+                self.framer.processIncomingPacket(data, replies.append, slave=0, single=True)  # bah
 
             except (
                 IncompleteRead,
@@ -679,6 +710,7 @@ class Slot(CtxObj):
         finally:
             self.run_lock = None
             self._running = False
+            del self.unit.slots[self.slot]
 
     def start(self):
         """
@@ -713,7 +745,7 @@ class Slot(CtxObj):
             k = self.modes[typ]
         except KeyError:
             self.modes[typ] = k = ValueList(self, typ)
-        val = cls() if isinstance(cls, type) else cls
+        val = cls(offset=offset) if isinstance(cls, type) else cls
         k.add(offset, val)
         return val
 
@@ -745,7 +777,7 @@ class Slot(CtxObj):
             return
         self._scope.cancel()
 
-    async def _getValues(self) -> Dict[TypeCodec, Dict[int, Any]]:
+    async def getValues(self) -> Dict[TypeCodec, Dict[int, Any]]:
         """
         Send messages reading this slot's values from the bus.
         Returns a (type,(offset,value)) dict-of-dicts.
@@ -778,7 +810,7 @@ class Slot(CtxObj):
         finally:
             self._get_scope = None
 
-    async def _setValues(self, changed=False):
+    async def setValues(self, changed=False):
         """
         Send a message writing the values in this block to the bus.
         """
@@ -799,7 +831,7 @@ class Slot(CtxObj):
         """Read this slot's data."""
         async with self.read_lock:
             self.t_read = anyio.current_time()
-            await self._getValues()
+            await self.getValues()
 
     async def read_task(self):
         """A background task for reading Modbus register values.
@@ -849,7 +881,7 @@ class Slot(CtxObj):
                         tn -= tn % self.read_delay
 
                 try:
-                    await self._getValues()  # already locked
+                    await self.getValues()  # already locked
                 except Exception as exc:  # pylint:disable=broad-except
                     _logger.warning("Error %s: %r", self, exc)
                     backoff = 1 + backoff * 1.2
@@ -863,7 +895,7 @@ class Slot(CtxObj):
         If @changed is set, only write changed data.
         """
         async with self.write_lock:
-            await self._setValues(changed=changed)
+            await self.setValues(changed=changed)
 
     async def write_task(self):
         """A background task for updating changed Modbus register values"""
@@ -889,7 +921,7 @@ class ValueList(DataBlock):
     """
 
     def __init__(self, slot, kind):
-        super().__init__(max_len=slot.unit.host.max_req_len)
+        super().__init__(max_rd_len=slot.unit.host.max_rd_len, max_wr_len=slot.unit.host.max_wr_len)
         self.slot = slot
         self.kind = kind
         self.do_write = anyio.Event()
@@ -906,7 +938,7 @@ class ValueList(DataBlock):
         if res is None:
             res = {}
         async with anyio.create_task_group() as tg:
-            for start, length in self.ranges():
+            for start, length in self.ranges(max_len=self.max_rd_len):
                 tg.start_soon(partial(self.readBlock, start, length, res=res))
         return res
 
@@ -915,7 +947,7 @@ class ValueList(DataBlock):
         Send messages writing our values to the bus.
         """
         async with anyio.create_task_group() as tg:
-            for start, length in self.ranges(changed):
+            for start, length in self.ranges(changed=changed, max_len=self.max_wr_len):
                 tg.start_soon(partial(self.writeBlock, start, length))
 
     async def readBlock(self, start, length, *, res=None):
@@ -923,7 +955,7 @@ class ValueList(DataBlock):
         if res is None:
             res = {}
         u = self.slot.unit
-        msg = self.kind.encoder(address=start, count=length, unit=u.unit)
+        msg = self.kind.encoder(address=start, count=length, slave=u.unit)
 
         r = await u.host.execute(msg)
 
@@ -955,9 +987,9 @@ class ValueList(DataBlock):
             off += val.len
             res -= val.len
         if len(values) == 1:
-            msg = self.kind.encoder_s(address=start, unit=u.unit, value=values[0])
+            msg = self.kind.encoder_s(address=start, slave=u.unit, value=values[0])
         else:
-            msg = self.kind.encoder_m(address=start, count=length, unit=u.unit, values=values)
+            msg = self.kind.encoder_m(address=start, count=length, slave=u.unit, values=values)
 
         r = await u.host.execute(msg)  # pylint: disable=unused-variable
         # raises an error if failed

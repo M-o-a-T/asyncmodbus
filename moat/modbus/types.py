@@ -6,44 +6,32 @@ from typing import List
 
 import anyio
 
-try:
-    from pymodbus.client.common import (
-        ReadCoilsRequest,
-        ReadCoilsResponse,
-        ReadDiscreteInputsRequest,
-        ReadDiscreteInputsResponse,
-        ReadHoldingRegistersRequest,
-        ReadHoldingRegistersResponse,
-        ReadInputRegistersRequest,
-        ReadInputRegistersResponse,
-        WriteMultipleCoilsRequest,
-        WriteMultipleCoilsResponse,
-        WriteMultipleRegistersRequest,
-        WriteMultipleRegistersResponse,
-        WriteSingleCoilRequest,
-        WriteSingleCoilResponse,
-        WriteSingleRegisterRequest,
-        WriteSingleRegisterResponse,
-    )
-except ImportError:
-    from pymodbus.factory import (
-        ReadCoilsRequest,
-        ReadCoilsResponse,
-        ReadDiscreteInputsRequest,
-        ReadDiscreteInputsResponse,
-        ReadHoldingRegistersRequest,
-        ReadHoldingRegistersResponse,
-        ReadInputRegistersRequest,
-        ReadInputRegistersResponse,
-        WriteMultipleCoilsRequest,
-        WriteMultipleCoilsResponse,
-        WriteMultipleRegistersRequest,
-        WriteMultipleRegistersResponse,
-        WriteSingleCoilRequest,
-        WriteSingleCoilResponse,
-        WriteSingleRegisterRequest,
-        WriteSingleRegisterResponse,
-    )
+from pymodbus.register_read_message import (
+    ReadHoldingRegistersRequest,
+    ReadHoldingRegistersResponse,
+    ReadInputRegistersRequest,
+    ReadInputRegistersResponse,
+)
+from pymodbus.register_write_message import (
+    WriteMultipleRegistersRequest,
+    WriteMultipleRegistersResponse,
+    WriteSingleRegisterRequest,
+    WriteSingleRegisterResponse,
+)
+from pymodbus.bit_read_message import (
+    ReadCoilsRequest,
+    ReadCoilsResponse,
+    ReadDiscreteInputsRequest,
+    ReadDiscreteInputsResponse,
+)
+from pymodbus.bit_write_message import (
+    WriteSingleCoilRequest,
+    WriteSingleCoilResponse,
+    WriteMultipleCoilsRequest,
+    WriteMultipleCoilsResponse,
+)
+
+MAX_REQ_LEN=30
 
 import logging
 
@@ -71,11 +59,12 @@ class BaseValue:
     block: "DataBlock" = None
     to_write: int = None
 
-    def __init__(self, value=None, idem=True):
+    def __init__(self, offset=None, value=None, idem=True):
         self.changed = anyio.Event()
         self._value = value
         self._value_w = value
         self.idem = idem
+        self.offset = offset
 
         if value is not None:
             self.gen = 1
@@ -156,7 +145,15 @@ class BaseValue:
         return f"‹{self.value}›"
 
     def __repr__(self):
-        return f"<{self.__class__.__name__}:{self.value}>"
+        res = f"<{self.__class__.__name__}"
+        if self.offset is not None:
+            res += f" @{self.offset}"
+        res += f":{self._value}"
+        if self._value_w != self._value:
+            res += f":{self._value_w}"
+        res += ">"
+
+        return res
 
     def __aiter__(self):
         return ValueIterator(self)
@@ -497,9 +494,10 @@ class DataBlock(dict, BaseModbusDataBlock):
     succeeds.
     """
 
-    def __init__(self, max_len=30):
+    def __init__(self, max_rd_len=MAX_REQ_LEN, max_wr_len=MAX_REQ_LEN):
         super().__init__()
-        self.max_len = max_len
+        self.max_rd_len = max_rd_len
+        self.max_wr_len = max_wr_len
         self.changed = anyio.Event()
 
     def reset(self):
@@ -552,7 +550,7 @@ class DataBlock(dict, BaseModbusDataBlock):
             count -= val.len
         return True
 
-    def ranges(self, changed=False):
+    def ranges(self, changed=False, max_len=MAX_REQ_LEN):
         """Iterate over to-be-retrieved/sent range(s).
 
         If @changed is set, skip unmodified items.
@@ -568,7 +566,7 @@ class DataBlock(dict, BaseModbusDataBlock):
             elif start is None:
                 start = offset
                 cur = start + val.len
-            elif cur == offset and (cur + val.len - start) <= self.max_len:
+            elif cur == offset and (cur + val.len - start) <= max_len:
                 cur += val.len
             else:
                 yield (start, cur - start)

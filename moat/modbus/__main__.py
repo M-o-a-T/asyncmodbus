@@ -140,7 +140,7 @@ def flint(v):
         return float(v)
 
 
-async def _client(host, port, unit, kind, start, num, type_, values, debug, interval):
+async def _client(host, port, unit, kind, start, num, type_, values, debug, interval, maxlen):
     """
     Basic Modbus-TCP client.
     """
@@ -149,9 +149,13 @@ async def _client(host, port, unit, kind, start, num, type_, values, debug, inte
 
     from moat.modbus.client import ModbusClient  # pylint: disable=import-outside-toplevel
 
+    c = {}
+    if maxlen:
+        c["max_rd_len"] = maxlen
+        c["max_wr_len"] = maxlen
     async with (
             ModbusClient() as g,
-            g.host(host, port) as h,
+            g.host(host, port, **c) as h,
             h.unit(unit) as u,
             u.slot("default") as s,
         ):
@@ -160,6 +164,8 @@ async def _client(host, port, unit, kind, start, num, type_, values, debug, inte
         if values:
             if len(values) == 1:
                 values = values * num
+            elif num == 1:
+                num = len(values)
             elif len(values) != num:
                 raise click.UsageError("One or N values!")
         for i in range(num):
@@ -172,9 +178,9 @@ async def _client(host, port, unit, kind, start, num, type_, values, debug, inte
         last_res = None
         while True:
             if values:
-                await s._setValues()  # pylint:disable=protected-access  ## TODO
+                await s.setValues()  # pylint:disable=protected-access  ## TODO
             else:
-                res = await s._getValues()  # pylint:disable=protected-access  ## TODO
+                res = await s.getValues()  # pylint:disable=protected-access  ## TODO
                 if last_res != res:
                     pprint(res)
                     last_res = res
@@ -206,6 +212,7 @@ def mk_client(m):
     c = click.option("--port", "-p", type=int, default=502, help="destination port")(c)
     c = click.option("--host", "-h", default="localhost", help="destination host")(c)
     c = click.option("--interval", "-i", type=float, help="loop: read/write every N seconds")(c)
+    c = click.option("--max-len", "-L", "maxlen", type=int, default=30, help="max. modbus words per packet")(c)
     c = m.command("client", context_settings=dict(show_default=True))(c)
     return c
 
@@ -214,7 +221,7 @@ client = mk_client(main)
 
 
 async def _serclient(
-    port, baudrate, stopbits, parity, unit, kind, start, num, type_, values, debug
+    port, baudrate, stopbits, parity, unit, kind, start, num, type_, values, debug, maxlen
 ):
     """
     Basic Modbus-RTU client.
@@ -224,9 +231,16 @@ async def _serclient(
 
     from moat.modbus.client import ModbusClient  # pylint: disable=import-outside-toplevel
 
-    async with ModbusClient() as g, g.serial(
-        port=port, baudrate=baudrate, stopbits=stopbits, parity=parity
-    ) as h, h.unit(unit) as u, u.slot("default") as s:
+    c = {}
+    if maxlen:
+        c["max_rd_len"] = maxlen
+        c["max_wr_len"] = maxlen
+    async with (
+        ModbusClient() as g,
+        g.serial(port=port, baudrate=baudrate, stopbits=stopbits, parity=parity, **c) as h,
+        h.unit(unit) as u,
+        u.slot("default") as s,
+    ):
         k = map_kind[kind[0]]
         t = get_type(type_)
         if values:
@@ -237,15 +251,15 @@ async def _serclient(
         for i in range(num):
             v = s.add(k, start, t)
             if values:
-                v.value = flint(values[i])
+                v.set(flint(values[i]))
             start += t.len
             num -= 1
 
         try:
             if values:
-                await s._setValues()  # pylint:disable=protected-access  ## TODO
+                await s.setValues()  # pylint:disable=protected-access  ## TODO
             else:
-                res = await s._getValues()  # pylint:disable=protected-access  ## TODO
+                res = await s.getValues()  # pylint:disable=protected-access  ## TODO
                 pprint(res)
         except Exception as exc:  # pylint: disable=broad-except
             log.exception("Problem: %r", exc)
@@ -281,6 +295,7 @@ def mk_serial_client(m):
     )
     c = add_serial_cfg(c)
     c = click.option("--unit", "-u", type=int, default=1, help="unit to query")(c)
+    c = click.option("--max-len", "-L", "maxlen", type=int, default=30, help="max. modbus words per packet")(c)
     c = m.command("serial", context_settings=dict(show_default=True))(c)
     return c
 
